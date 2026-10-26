@@ -1,353 +1,864 @@
-import os, json, sqlite3, logging, requests
-from flask import Flask, request, jsonify
+# -*- coding: utf-8 -*-
+"""
+VPN Config Shop Bot  |  ربات فروش کانفیگ
+Flask + Webhook + Supabase (REST)  |  Persian + English
+Roles: owner > admin > seller > user
+"""
+import os, io, json, html, logging, threading, time
+from datetime import datetime, timedelta, timezone
 
-TOKEN = os.getenv("BOT_TOKEN", "").strip()
-WEBHOOK_SECRET = os.getenv("WEBHOOK_SECRET", "change-this-secret")
-OWNER_ID = int(os.getenv("OWNER_ID", "6914909647"))
-DB_PATH = os.getenv("DB_PATH", "bot.db")
-API = f"https://api.telegram.org/bot{TOKEN}"
+import requests
+import telebot
+from telebot import types
+from flask import Flask, request, abort
+
 logging.basicConfig(level=logging.INFO)
+log = logging.getLogger("shop")
+
+BOT_TOKEN = os.environ["BOT_TOKEN"]
+OWNER_ID = int(os.environ.get("OWNER_ID", "6914909647"))
+SB_URL = os.environ["SUPABASE_URL"].rstrip("/")
+SB_KEY = os.environ["SUPABASE_KEY"]
+BASE_URL = (os.environ.get("WEBHOOK_URL") or os.environ.get("RENDER_EXTERNAL_URL") or "").rstrip("/")
+
+bot = telebot.TeleBot(BOT_TOKEN, parse_mode="HTML", threaded=False)
 app = Flask(__name__)
+STATE = {}   # uid -> {"s": state, ...}
+UC = {}      # user cache
 
-def db():
-    con = sqlite3.connect(DB_PATH)
-    con.row_factory = sqlite3.Row
-    return con
+# ───────────────────────── Database (Supabase REST) ─────────────────────────
+HDR = {"apikey": SB_KEY, "Authorization": "Bearer " + SB_KEY, "Content-Type": "application/json"}
 
-def init_db():
-    with db() as c:
-        c.executescript("""
-        CREATE TABLE IF NOT EXISTS users(
-          tg_id INTEGER PRIMARY KEY, username TEXT, first_name TEXT, lang TEXT DEFAULT 'fa',
-          phone TEXT, role TEXT DEFAULT 'customer', joined_at TEXT DEFAULT CURRENT_TIMESTAMP
-        );
-        CREATE TABLE IF NOT EXISTS plans(
-          id INTEGER PRIMARY KEY AUTOINCREMENT, name_fa TEXT NOT NULL, name_en TEXT NOT NULL,
-          volume_gb INTEGER NOT NULL, days INTEGER NOT NULL, price INTEGER NOT NULL, active INTEGER DEFAULT 1
-        );
-        CREATE TABLE IF NOT EXISTS configs(
-          id INTEGER PRIMARY KEY AUTOINCREMENT, plan_id INTEGER NOT NULL, config TEXT NOT NULL,
-          status TEXT DEFAULT 'available', order_id INTEGER
-        );
-        CREATE TABLE IF NOT EXISTS orders(
-          id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER NOT NULL, plan_id INTEGER NOT NULL,
-          status TEXT DEFAULT 'awaiting_receipt', receipt_file_id TEXT, config_id INTEGER,
-          created_at TEXT DEFAULT CURRENT_TIMESTAMP
-        );
-        CREATE TABLE IF NOT EXISTS settings(key TEXT PRIMARY KEY, value TEXT);
-        CREATE TABLE IF NOT EXISTS sellers(tg_id INTEGER PRIMARY KEY, approved INTEGER DEFAULT 0);
-        """)
-        c.execute("INSERT OR IGNORE INTO users(tg_id, role, lang) VALUES(?, 'owner', 'fa')", (OWNER_ID,))
-        c.execute("INSERT OR IGNORE INTO settings(key,value) VALUES('card_number','تنظیم نشده')")
-        c.execute("INSERT OR IGNORE INTO settings(key,value) VALUES('support_id','تنظیم نشده')")
-        c.execute("INSERT OR IGNORE INTO settings(key,value) VALUES('force_channels','[]')")
-        c.execute("INSERT OR IGNORE INTO settings(key,value) VALUES('welcome_fa','به فروشگاه کانفیگ V2Ray خوش آمدید.')")
-        c.execute("INSERT OR IGNORE INTO settings(key,value) VALUES('welcome_en','Welcome to the V2Ray configuration store.')")
 
-def setting(key, default=""):
-    with db() as c:
-        row = c.execute("SELECT value FROM settings WHERE key=?", (key,)).fetchone()
-    return row["value"] if row else default
+def _fv(v):
+    return str(v).lower() if isinstance(v, bool) else v
 
-def set_setting(key, value):
-    with db() as c:
-        c.execute("INSERT INTO settings(key,value) VALUES(?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value", (key, value))
 
-def tg(method, payload=None):
-    if not TOKEN:
-        logging.error("BOT_TOKEN is missing")
-        return {}
+def _rest(method, table, params=None, body=None, prefer="return=representation"):
+    h = dict(HDR)
+    if prefer:
+        h["Prefer"] = prefer
     try:
-        r = requests.post(f"{API}/{method}", json=payload or {}, timeout=20)
-        r.raise_for_status()
-        data = r.json()
-        if not data.get("ok"):
-            logging.warning("Telegram API error: %s", data)
-        return data
-    except Exception:
-        logging.exception("Telegram API request failed")
-        return {}
+        r = requests.request(method, f"{SB_URL}/rest/v1/{table}", headers=h, params=params,
+                             data=json.dumps(body) if body is not None else None, timeout=20)
+        if r.status_code >= 300:
+            log.error("DB %s %s -> %s %s", method, table, r.status_code, r.text[:300])
+            return []
+        return r.json() if r.text else []
+    except Exception as e:
+        log.error("DB error: %s", e)
+        return []
 
-def send(chat_id, text, keyboard=None, **kwargs):
-    p = {"chat_id": chat_id, "text": text, "parse_mode": "HTML", "disable_web_page_preview": True}
-    if keyboard: p["reply_markup"] = keyboard
-    p.update(kwargs)
-    return tg("sendMessage", p)
 
-def inline(rows):
-    return {"inline_keyboard": rows}
+def sel(table, order=None, limit=None, raw=None, **f):
+    p = {"select": "*"}
+    p.update({k: f"eq.{_fv(v)}" for k, v in f.items()})
+    if raw: p.update(raw)
+    if order: p["order"] = order
+    if limit: p["limit"] = limit
+    return _rest("GET", table, p, prefer=None)
 
-def is_admin(uid):
-    with db() as c:
-        row = c.execute("SELECT role FROM users WHERE tg_id=?", (uid,)).fetchone()
-    return bool(row and row["role"] in ("owner", "admin"))
 
-def lang_of(uid):
-    with db() as c:
-        row = c.execute("SELECT lang FROM users WHERE tg_id=?", (uid,)).fetchone()
-    return row["lang"] if row else "fa"
+def ins(table, row):
+    r = _rest("POST", table, body=row)
+    return r[0] if r else None
 
-def main_menu(uid):
-    fa = lang_of(uid) == "fa"
-    rows = [
-      [{"text": "🛍 خرید سرویس" if fa else "🛍 Buy service", "callback_data": "plans"}],
-      [{"text": "👤 حساب کاربری" if fa else "👤 My account", "callback_data": "account"},
-       {"text": "🆘 پشتیبانی" if fa else "🆘 Support", "callback_data": "support"}],
-      [{"text": "🌐 English" if fa else "🌐 فارسی", "callback_data": "lang_toggle"}]
-    ]
-    if is_admin(uid):
-        rows.append([{"text": "⚙️ پنل مدیریت" if fa else "⚙️ Admin panel", "callback_data": "admin"}])
-    return inline(rows)
 
-def upsert_user(user):
-    uid = user["id"]
-    with db() as c:
-        c.execute("""INSERT INTO users(tg_id,username,first_name) VALUES(?,?,?)
-        ON CONFLICT(tg_id) DO UPDATE SET username=excluded.username, first_name=excluded.first_name""",
-        (uid, user.get("username"), user.get("first_name")))
+def upsert(table, row):
+    r = _rest("POST", table, body=row, prefer="resolution=merge-duplicates,return=representation")
+    return r[0] if r else None
 
-def force_join_ok(uid):
+
+def upd(table, match, data):
+    return _rest("PATCH", table, {k: f"eq.{_fv(v)}" for k, v in match.items()}, body=data)
+
+
+def rm(table, match):
+    return _rest("DELETE", table, {k: f"eq.{_fv(v)}" for k, v in match.items()})
+
+
+def gs(key, default=""):
+    r = sel("settings", key=key)
+    return r[0]["value"] if r and r[0].get("value") is not None else default
+
+
+def ss(key, val):
+    upsert("settings", {"key": key, "value": val})
+
+
+# ───────────────────────── Helpers ─────────────────────────
+def esc(s): return html.escape(str(s if s is not None else ""))
+def money(n): return f"{int(n or 0):,}"
+def now_utc(): return datetime.now(timezone.utc)
+def fdate(s): return (s or "")[:10]
+
+
+def pdt(s):
     try:
-        channels = json.loads(setting("force_channels", "[]"))
+        return datetime.fromisoformat(s[:19]).replace(tzinfo=timezone.utc)
     except Exception:
-        channels = []
-    for ch in channels:
-        result = tg("getChatMember", {"chat_id": ch, "user_id": uid})
-        member = (result.get("result") or {}).get("status")
-        if not result.get("ok") or member not in ("creator", "administrator", "member"):
+        return None
+
+
+def user(uid):
+    if uid in UC: return UC[uid]
+    r = sel("users", id=uid)
+    if r: UC[uid] = r[0]
+    return r[0] if r else None
+
+
+def save_user(uid, **d):
+    upd("users", {"id": uid}, d)
+    UC.pop(uid, None)
+
+
+def ensure_user(tg):
+    u = user(tg.id)
+    uname = tg.username or ""
+    name = (tg.first_name or "") + (" " + tg.last_name if tg.last_name else "")
+    if not u:
+        ins("users", {"id": tg.id, "name": name, "username": uname,
+                      "role": "owner" if tg.id == OWNER_ID else "user"})
+        UC.pop(tg.id, None)
+        return user(tg.id)
+    ch = {}
+    if u.get("name") != name: ch["name"] = name
+    if (u.get("username") or "") != uname: ch["username"] = uname
+    if tg.id == OWNER_ID and u.get("role") != "owner": ch["role"] = "owner"
+    if ch:
+        save_user(tg.id, **ch)
+        u = user(tg.id)
+    return u
+
+
+def lang(uid):
+    u = user(uid)
+    return (u or {}).get("lang") or "fa"
+
+
+def x(uid, fa, en):
+    return fa if lang(uid) == "fa" else en
+
+
+def role(uid):
+    if uid == OWNER_ID: return "owner"
+    u = user(uid)
+    return (u or {}).get("role", "user")
+
+
+def is_staff(uid): return role(uid) in ("owner", "admin", "seller")
+def is_admin(uid): return role(uid) in ("owner", "admin")
+def is_owner(uid): return uid == OWNER_ID
+
+
+def staff_ids():
+    ids = {OWNER_ID}
+    for r in sel("users", raw={"role": "in.(admin,seller)"}):
+        ids.add(r["id"])
+    return list(ids)
+
+
+def K(*rows):
+    kb = types.InlineKeyboardMarkup()
+    for r in rows:
+        kb.row(*[types.InlineKeyboardButton(t, url=d) if d.startswith(("http", "tg:"))
+                 else types.InlineKeyboardButton(t, callback_data=d) for t, d in r])
+    return kb
+
+
+def ui(uid, text, kb=None, call=None):
+    """Edit the panel message in place (open/close feel) or send a new one."""
+    if call:
+        try:
+            bot.edit_message_text(text, call.message.chat.id, call.message.message_id,
+                                  reply_markup=kb, disable_web_page_preview=True)
+            return
+        except Exception as e:
+            if "not modified" in str(e): return
+    bot.send_message(uid, text, reply_markup=kb, disable_web_page_preview=True)
+
+
+def tg_link(u):
+    if u.get("username"): return "https://t.me/" + u["username"]
+    return f"tg://user?id={u['id']}"
+
+
+def qr_png(text):
+    try:
+        if len(text) > 1200: return None
+        import qrcode
+        b = io.BytesIO()
+        qrcode.make(text).save(b, "PNG")
+        b.seek(0)
+        return b
+    except Exception:
+        return None
+
+
+# ───────────────────────── Plans / formatting ─────────────────────────
+def traffic(uid, p):
+    g = p.get("traffic_gb") or 0
+    return x(uid, "نامحدود", "Unlimited") if not g else f"{g} GB"
+
+
+def plan_line(uid, p):
+    return (f"📦 <b>{esc(p['name'])}</b>\n   📊 {traffic(uid, p)}  •  ⏳ {p['days']} {x(uid, 'روز', 'days')}"
+            f"  •  💵 {money(p['price'])} {x(uid, 'تومان', 'T')}")
+
+
+def days_left(uid, o):
+    e = pdt(o.get("expires_at") or "")
+    if not e: return x(uid, "نامحدود", "No expiry")
+    d = (e - now_utc()).days
+    if e < now_utc(): return x(uid, "⛔️ منقضی شده", "⛔️ Expired")
+    return f"{d} {x(uid, 'روز مانده', 'days left')}"
+
+
+# ───────────────────────── Gates ─────────────────────────
+def not_joined(uid):
+    res = []
+    for ch in sel("channels"):
+        cid = int(ch["chat_id"]) if ch["chat_id"].lstrip("-").isdigit() else ch["chat_id"]
+        try:
+            m = bot.get_chat_member(cid, uid)
+            if m.status in ("left", "kicked"): res.append(ch)
+        except Exception as e:
+            log.warning("channel check failed %s: %s", ch["chat_id"], e)
+    return res
+
+
+def ask_phone(uid):
+    kb = types.ReplyKeyboardMarkup(resize_keyboard=True, one_time_keyboard=True)
+    kb.add(types.KeyboardButton(x(uid, "📱 اشتراک‌گذاری شماره", "📱 Share my phone"), request_contact=True))
+    bot.send_message(uid, x(uid, "📱 <b>فروشنده عزیز</b>، برای فعال شدن دسترسی باید شماره‌ات را با دکمه زیر به اشتراک بگذاری.",
+                            "📱 <b>Seller</b>, you must share your phone number with the button below to activate your access."),
+                     reply_markup=kb)
+
+
+def passes(uid, call=None):
+    u = user(uid)
+    if not u: return False
+    if u.get("banned"):
+        bot.send_message(uid, x(uid, "🚫 دسترسی شما مسدود شده است.", "🚫 You are banned."))
+        return False
+    if role(uid) == "seller" and not u.get("phone"):
+        ask_phone(uid)
+        return False
+    if not is_staff(uid):
+        nj = not_joined(uid)
+        if nj:
+            rows = [[(f"📢 {c.get('title') or c['chat_id']}", c.get("link") or "https://t.me/")] for c in nj]
+            rows.append([(x(uid, "✅ عضو شدم", "✅ I joined"), "chk")])
+            ui(uid, x(uid, "📢 برای استفاده از ربات ابتدا در کانال(های) زیر عضو شوید:",
+                      "📢 Please join the channel(s) below to use the bot:"), K(*rows), call)
             return False
     return True
 
-def prompt_join(chat_id):
-    try: channels = json.loads(setting("force_channels", "[]"))
-    except Exception: channels = []
-    rows = []
-    for ch in channels:
-        link = ch if str(ch).startswith("https://t.me/") else "https://t.me/" + str(ch).lstrip("@")
-        rows.append([{"text": "عضویت در کانال / Join channel", "url": link}])
-    rows.append([{"text": "✅ بررسی عضویت / Check membership", "callback_data": "check_join"}])
-    send(chat_id, "برای استفاده از ربات ابتدا در کانال(های) زیر عضو شوید.\nJoin the required channel(s) first.", inline(rows))
 
-def start(chat_id, user):
-    upsert_user(user)
-    if not force_join_ok(user["id"]):
-        prompt_join(chat_id); return
-    fa = lang_of(user["id"]) == "fa"
-    welcome = setting("welcome_fa" if fa else "welcome_en")
-    send(chat_id, welcome, main_menu(user["id"]))
+# ───────────────────────── Main panel ─────────────────────────
+def main_kb(uid):
+    r = [[(x(uid, "🛒 خرید سرویس", "🛒 Buy service"), "buy"), (x(uid, "📦 اشتراک‌های من", "📦 My subscriptions"), "subs")],
+         [(x(uid, "💰 تعرفه‌ها", "💰 Tariffs"), "tar"), (x(uid, "👤 حساب کاربری", "👤 My account"), "acc")],
+         [(x(uid, "🆘 پشتیبانی", "🆘 Support"), "sup"), (x(uid, "📚 آموزش اتصال", "📚 Guide"), "gd")],
+         [(x(uid, "🌐 زبان / Language", "🌐 Language / زبان"), "lang")]]
+    if is_staff(uid):
+        r.append([(x(uid, "🛠 پنل مدیریت", "🛠 Admin panel"), "a:open")])
+    r.append([(x(uid, "🔽 بستن پنل", "🔽 Close panel"), "p:close")])
+    return K(*r)
 
-def show_plans(chat_id, uid):
-    fa = lang_of(uid) == "fa"
-    with db() as c:
-        plans = c.execute("SELECT * FROM plans WHERE active=1 ORDER BY id").fetchall()
-    if not plans:
-        send(chat_id, "فعلاً سرویسی ثبت نشده است." if fa else "No services are available yet.", main_menu(uid)); return
-    for p in plans:
-        name = p["name_fa"] if fa else p["name_en"]
-        txt = (f"📦 <b>{name}</b>\nحجم: {p['volume_gb']} GB | مدت: {p['days']} روز\nقیمت: {p['price']:,} تومان"
-               if fa else f"📦 <b>{name}</b>\nVolume: {p['volume_gb']} GB | Duration: {p['days']} days\nPrice: {p['price']:,} toman")
-        send(chat_id, txt, inline([[{"text": "انتخاب و خرید" if fa else "Select & buy", "callback_data": f"buy:{p['id']}"}]]))
 
-def account(chat_id, uid):
-    fa = lang_of(uid) == "fa"
-    with db() as c:
-        user = c.execute("SELECT * FROM users WHERE tg_id=?", (uid,)).fetchone()
-        orders = c.execute("""SELECT o.id,o.status,p.name_fa,p.name_en,p.volume_gb,p.days
-          FROM orders o JOIN plans p ON p.id=o.plan_id WHERE o.user_id=? ORDER BY o.id DESC LIMIT 10""", (uid,)).fetchall()
-    text = ("👤 <b>حساب کاربری</b>\n" if fa else "👤 <b>My account</b>\n")
-    text += f"ID: <code>{uid}</code>\n"
-    text += (f"نقش: {user['role']}\n" if fa else f"Role: {user['role']}\n")
-    text += ("📄 سفارش‌ها:\n" if fa else "📄 Orders:\n")
-    if not orders: text += ("هنوز سفارشی ندارید." if fa else "No orders yet.")
-    for o in orders:
-        nm = o["name_fa"] if fa else o["name_en"]
-        text += f"\n#{o['id']} — {nm} — {o['status']}"
-    send(chat_id, text, main_menu(uid))
+def show_main(uid, call=None):
+    u = user(uid)
+    w = gs("welcome")
+    if not w:
+        w = x(uid, "👋 سلام <b>{name}</b>!\nبه فروشگاه کانفیگ خوش آمدی 🚀\nاز پنل زیر استفاده کن 👇",
+              "👋 Hi <b>{name}</b>!\nWelcome to the config shop 🚀\nUse the panel below 👇")
+        w = w.replace("{name}", esc(u.get("name")))
+    ui(uid, w, main_kb(uid), call)
 
-def admin_menu(chat_id):
-    send(chat_id, "⚙️ <b>پنل مدیریت</b>\nفرمان‌ها را در چت ارسال کنید:\n"
-      "/setcard شماره_کارت\n/setchannels @channel1,@channel2\n/set support شناسه_پشتیبانی\n"
-      "/addplan نام_فارسی|English name|حجم_GB|روز|قیمت\n/addconfig شناسه_پلن سپس متن کانفیگ را در پیام بعدی\n"
-      "/stats\n/addadmin user_id\n/approve_seller user_id\n\n"
-      "برای تعریف کانفیگ، ابتدا /addconfig PLAN_ID بفرستید و در پیام بعد کانفیگ را ارسال کنید.",
-      inline([[{"text":"📊 آمار","callback_data":"stats"}],[{"text":"🏠 منو","callback_data":"home"}]]))
 
-pending_config = {}
+def back_row(uid, to="p:main"):
+    return [(x(uid, "🔙 بازگشت", "🔙 Back"), to)]
 
-def handle_message(m):
-    chat_id = m["chat"]["id"]
-    user = m.get("from", {})
-    uid = user.get("id")
-    if not uid: return
-    upsert_user(user)
-    text = m.get("text", "")
-    if text == "/start":
-        start(chat_id, user); return
-    if not force_join_ok(uid):
-        prompt_join(chat_id); return
-    if text == "/admin" and is_admin(uid):
-        admin_menu(chat_id); return
-    if uid in pending_config:
-        plan_id = pending_config.pop(uid)
-        config_text = text.strip()
-        with db() as c:
-            plan = c.execute("SELECT id FROM plans WHERE id=?", (plan_id,)).fetchone()
-            if plan and config_text:
-                c.execute("INSERT INTO configs(plan_id,config) VALUES(?,?)", (plan_id, config_text))
-                send(chat_id, f"✅ کانفیگ برای پلن {plan_id} ثبت شد.")
-            else:
-                send(chat_id, "پلن پیدا نشد یا کانفیگ خالی بود.")
+
+def lang_picker(uid):
+    return K([("🇮🇷 فارسی", "l:fa"), ("🇬🇧 English", "l:en")])
+
+
+@bot.message_handler(commands=["start", "panel", "menu"])
+def h_start(m):
+    uid = m.from_user.id
+    u = ensure_user(m.from_user)
+    STATE.pop(uid, None)
+    if not u.get("lang"):
+        bot.send_message(uid, "🌐 زبان خود را انتخاب کنید\nPlease choose your language", reply_markup=lang_picker(uid))
         return
-    if text.startswith("/setcard ") and is_admin(uid):
-        set_setting("card_number", text.split(" ",1)[1].strip()); send(chat_id, "شماره کارت ذخیره شد."); return
-    if text.startswith("/setchannels ") and is_admin(uid):
-        vals = [x.strip() for x in text.split(" ",1)[1].split(",") if x.strip()]
-        set_setting("force_channels", json.dumps(vals, ensure_ascii=False))
-        send(chat_id, "کانال‌های عضویت اجباری ذخیره شدند. ربات باید در کانال‌ها دسترسی لازم برای بررسی عضویت داشته باشد."); return
-    if text.startswith("/set support ") and is_admin(uid):
-        set_setting("support_id", text.split(" ",2)[2].strip()); send(chat_id, "شناسه پشتیبانی ذخیره شد."); return
-    if text.startswith("/addplan ") and is_admin(uid):
-        try:
-            fa,en,gb,days,price = [x.strip() for x in text.split(" ",1)[1].split("|")]
-            with db() as c: c.execute("INSERT INTO plans(name_fa,name_en,volume_gb,days,price) VALUES(?,?,?,?,?)",(fa,en,int(gb),int(days),int(price)))
-            send(chat_id, "تعرفه با موفقیت اضافه شد.")
-        except Exception: send(chat_id, "فرمت نادرست است:\n/addplan نام فارسی|English name|50|30|150000")
-        return
-    if text.startswith("/addconfig ") and is_admin(uid):
-        try:
-            pending_config[uid] = int(text.split(" ",1)[1])
-            send(chat_id, "حالا متن کامل کانفیگ این پلن را در پیام بعدی بفرست.")
-        except Exception: send(chat_id, "استفاده: /addconfig PLAN_ID")
-        return
-    if text == "/stats" and is_admin(uid):
-        with db() as c:
-            users = c.execute("SELECT COUNT(*) n FROM users").fetchone()["n"]
-            orders = c.execute("SELECT COUNT(*) n FROM orders").fetchone()["n"]
-            paid = c.execute("SELECT COUNT(*) n FROM orders WHERE status='paid'").fetchone()["n"]
-            revenue = c.execute("SELECT COALESCE(SUM(p.price),0) n FROM orders o JOIN plans p ON p.id=o.plan_id WHERE o.status='paid'").fetchone()["n"]
-        send(chat_id, f"📊 آمار\nکاربران: {users}\nسفارش‌ها: {orders}\nپرداخت‌شده: {paid}\nفروش ثبت‌شده: {revenue:,} تومان"); return
-    if text.startswith("/addadmin ") and uid == OWNER_ID:
-        try:
-            target = int(text.split(" ",1)[1])
-            with db() as c:
-                c.execute("INSERT INTO users(tg_id,role,lang) VALUES(?,'admin','fa') ON CONFLICT(tg_id) DO UPDATE SET role='admin'", (target,))
-            send(chat_id, f"ادمین {target} اضافه شد.")
-        except Exception: send(chat_id, "استفاده: /addadmin user_id")
-        return
-    if text.startswith("/approve_seller ") and uid == OWNER_ID:
-        try:
-            target = int(text.split(" ",1)[1])
-            with db() as c:
-                c.execute("INSERT INTO sellers(tg_id,approved) VALUES(?,1) ON CONFLICT(tg_id) DO UPDATE SET approved=1", (target,))
-                c.execute("UPDATE users SET role='seller' WHERE tg_id=?", (target,))
-            send(chat_id, f"فروشنده {target} تأیید شد.")
-        except Exception: send(chat_id, "استفاده: /approve_seller user_id")
-        return
-    if m.get("contact"):
-        phone = m["contact"].get("phone_number", "")
-        with db() as c: c.execute("UPDATE users SET phone=? WHERE tg_id=?", (phone, uid))
-        send(chat_id, "شماره تماس ذخیره شد." if lang_of(uid)=="fa" else "Phone number saved.", main_menu(uid))
-        return
-    if m.get("photo"):
-        with db() as c:
-            order = c.execute("SELECT * FROM orders WHERE user_id=? AND status='awaiting_receipt' ORDER BY id DESC LIMIT 1", (uid,)).fetchone()
-            if order:
-                file_id = m["photo"][-1]["file_id"]
-                c.execute("UPDATE orders SET receipt_file_id=?,status='receipt_sent' WHERE id=?", (file_id, order["id"]))
-                with db() as c2:
-                    admins = c2.execute("SELECT tg_id FROM users WHERE role IN ('owner','admin')").fetchall()
-                for a in admins:
-                    send(a["tg_id"], f"🧾 رسید سفارش #{order['id']}\nکاربر: <code>{uid}</code>\nبرای تأیید یا رد:", inline([
-                      [{"text":"✅ پرداخت شد / Deliver config","callback_data":f"approve:{order['id']}"},
-                       {"text":"❌ رد پرداخت / Reject","callback_data":f"reject:{order['id']}"}]
-                    ]))
-                    tg("sendPhoto", {"chat_id":a["tg_id"],"photo":file_id,"caption":f"Receipt for order #{order['id']}"})
-                send(chat_id, "رسید دریافت شد و برای بررسی ارسال شد." if lang_of(uid)=="fa" else "Receipt received and sent for review.")
-            else:
-                send(chat_id, "سفارش منتظر رسیدی ندارید. ابتدا سرویس را انتخاب کنید." if lang_of(uid)=="fa" else "No order awaiting a receipt. Choose a service first.")
-        return
-    if text:
-        send(chat_id, "از منوی ربات استفاده کنید." if lang_of(uid)=="fa" else "Please use the bot menu.", main_menu(uid))
+    if passes(uid):
+        show_main(uid)
 
-def handle_callback(q):
-    uid = q["from"]["id"]
-    chat_id = q["message"]["chat"]["id"]
-    data = q.get("data","")
-    tg("answerCallbackQuery", {"callback_query_id": q["id"]})
-    if data == "lang_toggle":
-        with db() as c:
-            old = c.execute("SELECT lang FROM users WHERE tg_id=?", (uid,)).fetchone()
-            new = "en" if old and old["lang"]=="fa" else "fa"
-            c.execute("UPDATE users SET lang=? WHERE tg_id=?", (new,uid))
-        send(chat_id, "Language updated." if new=="en" else "زبان تغییر کرد.", main_menu(uid))
-    elif data == "home":
-        send(chat_id, "Main menu / منوی اصلی", main_menu(uid))
-    elif data == "check_join":
-        if force_join_ok(uid): send(chat_id, "عضویت تأیید شد / Membership verified.", main_menu(uid))
-        else: prompt_join(chat_id)
-    elif data == "plans": show_plans(chat_id, uid)
-    elif data == "account": account(chat_id, uid)
-    elif data == "support":
-        s = setting("support_id","تنظیم نشده")
-        send(chat_id, f"🆘 Support / پشتیبانی: {s}", main_menu(uid))
-    elif data == "admin":
-        if is_admin(uid): admin_menu(chat_id)
-    elif data == "stats":
-        if is_admin(uid):
-            with db() as c:
-                users = c.execute("SELECT COUNT(*) n FROM users").fetchone()["n"]
-                orders = c.execute("SELECT COUNT(*) n FROM orders").fetchone()["n"]
-                paid = c.execute("SELECT COUNT(*) n FROM orders WHERE status='paid'").fetchone()["n"]
-                revenue = c.execute("SELECT COALESCE(SUM(p.price),0) n FROM orders o JOIN plans p ON p.id=o.plan_id WHERE o.status='paid'").fetchone()["n"]
-            send(chat_id, f"📊 Users: {users}\nOrders: {orders}\nPaid: {paid}\nRecorded sales: {revenue:,}")
-    elif data.startswith("buy:"):
-        plan_id = int(data.split(":")[1])
-        with db() as c:
-            p = c.execute("SELECT * FROM plans WHERE id=? AND active=1", (plan_id,)).fetchone()
-            if not p: send(chat_id, "سرویس در دسترس نیست."); return
-            c.execute("INSERT INTO orders(user_id,plan_id) VALUES(?,?)", (uid,plan_id))
-            order_id = c.execute("SELECT last_insert_rowid() id").fetchone()["id"]
-        fa = lang_of(uid)=="fa"
-        card = setting("card_number","تنظیم نشده")
-        text = (f"سفارش #{order_id}\nمبلغ: {p['price']:,} تومان\nشماره کارت: <code>{card}</code>\nپس از پرداخت، تصویر رسید را همین‌جا ارسال کنید."
-                if fa else f"Order #{order_id}\nAmount: {p['price']:,} toman\nCard number: <code>{card}</code>\nPay, then send the receipt image here.")
-        send(chat_id, text)
-    elif data.startswith("approve:") and is_admin(uid):
-        oid = int(data.split(":")[1])
-        with db() as c:
-            order = c.execute("SELECT * FROM orders WHERE id=?", (oid,)).fetchone()
-            if not order or order["status"]=="paid":
-                send(chat_id, "سفارش پیدا نشد یا قبلاً تأیید شده."); return
-            cfg = c.execute("SELECT * FROM configs WHERE plan_id=? AND status='available' ORDER BY id LIMIT 1", (order["plan_id"],)).fetchone()
-            if not cfg:
-                send(chat_id, "⚠️ کانفیگ آماده‌ای برای این پلن موجود نیست. ابتدا کانفیگ اضافه کنید؛ سفارش هنوز تحویل نشده.")
-                return
-            c.execute("UPDATE configs SET status='delivered',order_id=? WHERE id=?", (oid,cfg["id"]))
-            c.execute("UPDATE orders SET status='paid',config_id=? WHERE id=?", (cfg["id"],oid))
-        send(order["user_id"], f"✅ پرداخت تأیید شد!\nکانفیگ شما:\n<code>{cfg['config']}</code>\nآن را در کلاینت سازگار با V2Ray وارد کنید.")
-        send(chat_id, f"سفارش #{oid} تأیید شد و کانفیگ تحویل داده شد.")
-    elif data.startswith("reject:") and is_admin(uid):
-        oid = int(data.split(":")[1])
-        with db() as c:
-            order = c.execute("SELECT * FROM orders WHERE id=?", (oid,)).fetchone()
-            if order: c.execute("UPDATE orders SET status='rejected' WHERE id=?", (oid,))
-        if order: send(order["user_id"], f"پرداخت سفارش #{oid} رد شد. لطفاً با پشتیبانی تماس بگیرید.")
-        send(chat_id, f"سفارش #{oid} رد شد.")
 
-@app.route("/webhook/" + WEBHOOK_SECRET, methods=["POST"])
-def webhook():
-    update = request.get_json(silent=True) or {}
+@bot.message_handler(content_types=["contact"])
+def h_contact(m):
+    uid = m.from_user.id
+    if m.contact and m.contact.user_id == uid:
+        save_user(uid, phone=m.contact.phone_number)
+        bot.send_message(uid, x(uid, "✅ شماره ثبت شد.", "✅ Phone saved."), reply_markup=types.ReplyKeyboardRemove())
+        if passes(uid): show_main(uid)
+    else:
+        bot.send_message(uid, x(uid, "⚠️ فقط شماره خودت را بفرست.", "⚠️ Please share your own number."))
+
+
+# ───────────────────────── Callbacks ─────────────────────────
+@bot.callback_query_handler(func=lambda c: True)
+def on_cb(call):
+    uid = call.from_user.id
+    d = call.data
     try:
-        if "message" in update: handle_message(update["message"])
-        elif "callback_query" in update: handle_callback(update["callback_query"])
+        bot.answer_callback_query(call.id)
     except Exception:
-        logging.exception("Failed to process update")
-    return jsonify(ok=True)
+        pass
+    try:
+        route(call, uid, d)
+    except Exception as e:
+        log.exception("callback error: %s", e)
 
-@app.get("/health")
-def health():
-    return jsonify(status="ok")
+
+def route(call, uid, d):
+    u = ensure_user(call.from_user)
+    if d.startswith("l:"):
+        save_user(uid, lang=d[2:])
+        if passes(uid): show_main(uid, call)
+        return
+    if not u.get("lang"):
+        ui(uid, "🌐 زبان خود را انتخاب کنید / Choose language", lang_picker(uid), call)
+        return
+    if not passes(uid, call): return
+    p = d.split(":")
+
+    # ── navigation ──
+    if d in ("p:main", "chk"): STATE.pop(uid, None); return show_main(uid, call)
+    if d == "p:close":
+        return ui(uid, x(uid, "📕 پنل بسته شد.", "📕 Panel closed."),
+                  K([(x(uid, "📖 باز کردن پنل", "📖 Open panel"), "p:open")]), call)
+    if d == "p:open": return show_main(uid, call)
+    if d == "lang":
+        return ui(uid, "🌐 زبان خود را انتخاب کنید / Choose language",
+                  K([("🇮🇷 فارسی", "l:fa"), ("🇬🇧 English", "l:en")], back_row(uid)), call)
+    if d == "cancel":
+        st = STATE.pop(uid, None)
+        if st and st.get("oid"):
+            o = get_order(st["oid"])
+            if o and o["status"] == "waiting_receipt":
+                upd("orders", {"id": o["id"]}, {"status": "cancelled"})
+        return show_main(uid, call)
+
+    # ── tariffs / buy ──
+    if d == "tar":
+        plans = sel("plans", active=True, order="price.asc")
+        txt = x(uid, "💰 <b>تعرفه سرویس‌ها</b>\n\n", "💰 <b>Service tariffs</b>\n\n")
+        txt += "\n\n".join(plan_line(uid, pl) for pl in plans) if plans else x(uid, "هنوز سرویسی ثبت نشده.", "No plans yet.")
+        return ui(uid, txt, K([(x(uid, "🛒 خرید", "🛒 Buy"), "buy")], back_row(uid)), call)
+    if d == "buy":
+        if gs("shop_open", "1") == "0" and not is_staff(uid):
+            return ui(uid, x(uid, "🔒 فروشگاه موقتاً بسته است.", "🔒 The shop is temporarily closed."),
+                      K(back_row(uid)), call)
+        plans = sel("plans", active=True, order="price.asc")
+        if not plans:
+            return ui(uid, x(uid, "هنوز سرویسی ثبت نشده.", "No plans yet."), K(back_row(uid)), call)
+        rows = [[(f"{pl['name']} • {money(pl['price'])}", f"b:{pl['id']}")] for pl in plans]
+        rows.append(back_row(uid))
+        return ui(uid, x(uid, "🛒 سرویس مورد نظرت را انتخاب کن:", "🛒 Choose your service:"), K(*rows), call)
+    if p[0] == "b":
+        pl = sel("plans", id=int(p[1]))
+        if not pl: return
+        pl = pl[0]
+        card, holder = gs("card_number"), gs("card_holder")
+        txt = plan_line(uid, pl) + "\n\n"
+        if card:
+            txt += x(uid, "💳 <b>اطلاعات پرداخت</b>\nمبلغ را به کارت زیر واریز کن:\n\n", "💳 <b>Payment</b>\nTransfer the amount to this card:\n\n")
+            txt += f"<code>{esc(card)}</code>\n👤 {esc(holder)}\n💵 <b>{money(pl['price'])}</b> {x(uid, 'تومان', 'T')}\n\n"
+            txt += x(uid, "پس از پرداخت روی «ارسال رسید» بزن و عکس رسید را بفرست.", "After paying tap “Send receipt” and upload the receipt photo.")
+        else:
+            txt += x(uid, "⚠️ شماره کارت هنوز تنظیم نشده؛ با پشتیبانی تماس بگیر.", "⚠️ Card not set yet; contact support.")
+        return ui(uid, txt, K([(x(uid, "📤 ارسال رسید", "📤 Send receipt"), f"pay:{pl['id']}")], back_row(uid, "buy")), call)
+    if p[0] == "pay":
+        pl = sel("plans", id=int(p[1]))
+        if not pl: return
+        pl = pl[0]
+        o = ins("orders", {"user_id": uid, "plan_id": pl["id"], "plan_name": pl["name"], "traffic_gb": pl["traffic_gb"],
+                           "days": pl["days"], "price": pl["price"], "status": "waiting_receipt"})
+        STATE[uid] = {"s": "receipt", "oid": o["id"]}
+        return ui(uid, x(uid, "📸 عکس رسید پرداخت را همین‌جا بفرست (یا کد پیگیری را بنویس).",
+                         "📸 Send the payment receipt photo here (or type the reference code)."),
+                  K([(x(uid, "❌ انصراف", "❌ Cancel"), "cancel")]), call)
+
+    # ── subscriptions ──
+    if d == "subs":
+        orders = sel("orders", user_id=uid, status="delivered", order="id.desc", limit=30)
+        if not orders:
+            return ui(uid, x(uid, "📭 هنوز اشتراکی نداری.", "📭 You have no subscriptions yet."),
+                      K([(x(uid, "🛒 خرید", "🛒 Buy"), "buy")], back_row(uid)), call)
+        rows = [[(f"#{o['id']} • {o['plan_name']} • {days_left(uid, o)}", f"s:{o['id']}")] for o in orders]
+        rows.append(back_row(uid))
+        return ui(uid, x(uid, "📦 <b>اشتراک‌های من</b>\nبرای دیدن کانفیگ روی هرکدام بزن:",
+                         "📦 <b>My subscriptions</b>\nTap one to see its config:"), K(*rows), call)
+    if p[0] == "s":
+        o = get_order(int(p[1]))
+        if not o or o["user_id"] != uid: return
+        txt = x(uid, "📦 <b>{n}</b>\n📊 حجم: {t}\n⏳ وضعیت: {d}\n📅 انقضا: {e}\n\n🔑 <b>کانفیگ (برای کپی لمس کنید):</b>\n<code>{c}</code>",
+                "📦 <b>{n}</b>\n📊 Traffic: {t}\n⏳ Status: {d}\n📅 Expires: {e}\n\n🔑 <b>Config (tap to copy):</b>\n<code>{c}</code>")
+        txt = txt.format(n=esc(o["plan_name"]), t=traffic(uid, o), d=days_left(uid, o),
+                         e=fdate(o.get("expires_at")) or "∞", c=esc(o.get("config")))
+        ui(uid, txt, K(back_row(uid, "subs")), call)
+        q = qr_png(o.get("config") or "")
+        if q: bot.send_photo(uid, q, caption="QR")
+        return
+
+    # ── account / support / guide ──
+    if d == "acc":
+        orders = sel("orders", user_id=uid)
+        done = [o for o in orders if o["status"] == "delivered"]
+        active = [o for o in done if not (pdt(o.get("expires_at") or "") and pdt(o["expires_at"]) < now_utc())]
+        rl = {"owner": x(uid, "👑 مالک", "👑 Owner"), "admin": x(uid, "🛡 ادمین", "🛡 Admin"),
+              "seller": x(uid, "🧑‍💼 فروشنده", "🧑‍💼 Seller"), "user": x(uid, "👤 کاربر", "👤 User")}[role(uid)]
+        txt = x(uid,
+                "👤 <b>حساب کاربری</b>\n\n🆔 آیدی: <code>{id}</code>\n📛 نام: {n}\n🔗 یوزرنیم: {un}\n🎖 نقش: {r}\n🌐 زبان: فارسی\n📅 عضویت: {j}\n"
+                "━━━━━━━━━━\n🛒 سفارش‌ها: {oc}\n✅ اشتراک فعال: {ac}\n💰 مجموع خرید: {sp} تومان",
+                "👤 <b>My account</b>\n\n🆔 ID: <code>{id}</code>\n📛 Name: {n}\n🔗 Username: {un}\n🎖 Role: {r}\n🌐 Language: English\n📅 Joined: {j}\n"
+                "━━━━━━━━━━\n🛒 Orders: {oc}\n✅ Active subs: {ac}\n💰 Total spent: {sp} T")
+        txt = txt.format(id=uid, n=esc(u["name"]), un="@" + u["username"] if u.get("username") else "-", r=rl,
+                         j=fdate(u["joined_at"]), oc=len(done), ac=len(active), sp=money(sum(o["price"] or 0 for o in done)))
+        return ui(uid, txt, K(back_row(uid)), call)
+    if d == "sup":
+        owner = user(OWNER_ID)
+        txt = x(uid, "🆘 <b>پشتیبانی</b>\n\n", "🆘 <b>Support</b>\n\n")
+        rows = []
+        if owner:
+            txt += x(uid, "👑 مالک: ", "👑 Owner: ") + (f"@{owner['username']}" if owner.get("username") else esc(owner["name"])) + f" (<code>{OWNER_ID}</code>)\n"
+            rows.append([(x(uid, "👑 پیام به مالک", "👑 Message owner"), tg_link(owner))])
+        sellers = sel("users", role="seller")
+        for s in sellers[:8]:
+            txt += "\n🧑‍💼 " + x(uid, "فروشنده: ", "Seller: ") + esc(s["name"]) + (f" @{s['username']}" if s.get("username") else "")
+            txt += f"\n   🆔 <code>{s['id']}</code>" + (f"  📞 <code>{esc(s['phone'])}</code>" if s.get("phone") else "") + "\n"
+            rows.append([(f"🧑‍💼 {s['name']}", tg_link(s))])
+        extra = gs("support_extra")
+        if extra: txt += "\n" + esc(extra)
+        rows.append(back_row(uid))
+        return ui(uid, txt, K(*rows), call)
+    if d == "gd":
+        g = gs("guide") or x(uid,
+            "📚 <b>آموزش اتصال</b>\n\n1️⃣ کانفیگ را از «اشتراک‌های من» کپی کن.\n2️⃣ یکی از برنامه‌ها را نصب کن:\n"
+            "• اندروید: v2rayNG / Hiddify\n• iOS: Streisand / V2Box / Shadowrocket\n• ویندوز: v2rayN / Hiddify\n• مک: V2Box / Hiddify\n"
+            "3️⃣ در برنامه گزینه Import from clipboard را بزن و وصل شو ✅",
+            "📚 <b>Connection guide</b>\n\n1️⃣ Copy your config from “My subscriptions”.\n2️⃣ Install an app:\n"
+            "• Android: v2rayNG / Hiddify\n• iOS: Streisand / V2Box / Shadowrocket\n• Windows: v2rayN / Hiddify\n• Mac: V2Box / Hiddify\n"
+            "3️⃣ Tap “Import from clipboard” and connect ✅")
+        return ui(uid, g, K(back_row(uid)), call)
+
+    # ── staff: order actions ──
+    if p[0] == "o" and is_staff(uid):
+        return order_action(call, uid, p)
+    # ── admin panel ──
+    if p[0] == "a" and is_staff(uid):
+        return admin_route(call, uid, p)
+    if p[0] == "u" and is_admin(uid):
+        return user_action(call, uid, p)
+
+
+# ───────────────────────── Orders ─────────────────────────
+def get_order(oid):
+    r = sel("orders", id=oid)
+    return r[0] if r else None
+
+
+def order_text(uid, o, u):
+    st = {"pending": "⏳", "paid": "💳", "delivered": "✅", "rejected": "❌", "waiting_receipt": "🕓", "cancelled": "🚫"}.get(o["status"], "")
+    t = x(uid, "🧾 <b>سفارش #{id}</b> {st}\n👤 {n} {un} <code>{uid}</code>\n📦 {p} • {tr}\n💵 {pr} تومان\n🕒 {t}",
+          "🧾 <b>Order #{id}</b> {st}\n👤 {n} {un} <code>{uid}</code>\n📦 {p} • {tr}\n💵 {pr} T\n🕒 {t}")
+    t = t.format(id=o["id"], st=st, n=esc(u.get("name")), un="@" + u["username"] if u.get("username") else "",
+                 uid=o["user_id"], p=esc(o["plan_name"]), tr=traffic(uid, o), pr=money(o["price"]), t=fdate(o["created_at"]))
+    if o.get("receipt_text"): t += "\n📝 " + esc(o["receipt_text"][:300])
+    return t
+
+
+def send_order_card(to, o):
+    u = user(o["user_id"]) or {}
+    cap = order_text(to, o, u)
+    kb = None
+    if o["status"] == "pending":
+        kb = K([(x(to, "✅ پرداخت شد", "✅ Paid"), f"o:ok:{o['id']}"), (x(to, "❌ رد", "❌ Reject"), f"o:no:{o['id']}")])
+    elif o["status"] == "paid":
+        kb = K([(x(to, "📤 ارسال کانفیگ", "📤 Send config"), f"o:cfg:{o['id']}")])
+    try:
+        t, fid = o.get("receipt_type"), o.get("receipt_file_id")
+        if t == "photo" and fid: bot.send_photo(to, fid, caption=cap, reply_markup=kb)
+        elif t == "document" and fid: bot.send_document(to, fid, caption=cap, reply_markup=kb)
+        else: bot.send_message(to, cap, reply_markup=kb)
+    except Exception as e:
+        log.warning("card send failed %s: %s", to, e)
+
+
+def order_action(call, uid, p):
+    act, oid = p[1], int(p[2])
+    o = get_order(oid)
+    if not o: return
+    def strip():
+        try: bot.edit_message_reply_markup(call.message.chat.id, call.message.message_id, reply_markup=None)
+        except Exception: pass
+    if act == "v":
+        return send_order_card(uid, o)
+    if act == "ok":
+        if o["status"] != "pending":
+            return bot.send_message(uid, x(uid, f"ℹ️ سفارش #{oid} قبلاً بررسی شده ({o['status']}).", f"ℹ️ Order #{oid} already handled ({o['status']})."))
+        upd("orders", {"id": oid}, {"status": "paid", "approved_by": uid})
+        strip()
+        STATE[uid] = {"s": "deliver", "oid": oid}
+        bot.send_message(o["user_id"], x(o["user_id"], f"✅ پرداخت سفارش #{oid} تأیید شد. کانفیگ تا لحظاتی دیگر ارسال می‌شود…",
+                                         f"✅ Payment for order #{oid} confirmed. Your config is coming shortly…"))
+        bot.send_message(uid, x(uid, f"✍️ کانفیگ سفارش <b>#{oid}</b> ({esc(o['plan_name'])}) را بفرست (متن/لینک ساب).\nبرای لغو /start",
+                                f"✍️ Send the config for order <b>#{oid}</b> ({esc(o['plan_name'])}) (text / sub link).\n/start to cancel"))
+    elif act == "cfg":
+        if o["status"] != "paid": return bot.send_message(uid, "ℹ️ " + o["status"])
+        STATE[uid] = {"s": "deliver", "oid": oid}
+        bot.send_message(uid, x(uid, f"✍️ کانفیگ سفارش <b>#{oid}</b> را بفرست:", f"✍️ Send config for order <b>#{oid}</b>:"))
+    elif act == "no":
+        if o["status"] != "pending":
+            return bot.send_message(uid, x(uid, f"ℹ️ سفارش #{oid} قبلاً بررسی شده.", f"ℹ️ Order #{oid} already handled."))
+        upd("orders", {"id": oid}, {"status": "rejected", "approved_by": uid})
+        strip()
+        bot.send_message(o["user_id"], x(o["user_id"], f"❌ رسید سفارش #{oid} تأیید نشد. در صورت اشتباه با پشتیبانی تماس بگیرید.",
+                                         f"❌ Receipt for order #{oid} was rejected. Contact support if this is a mistake."))
+        bot.send_message(uid, x(uid, f"❌ سفارش #{oid} رد شد.", f"❌ Order #{oid} rejected."))
+
+
+def send_config(to, o, cfg):
+    txt = x(to, "✅ <b>سفارش #{id} تحویل شد</b>\n📦 {p}\n📊 حجم: {t}\n⏳ مدت: {d} روز\n\n🔑 <b>کانفیگ (لمس برای کپی):</b>\n<code>{c}</code>\n\n"
+                "📚 آموزش اتصال: /start ← آموزش اتصال",
+            "✅ <b>Order #{id} delivered</b>\n📦 {p}\n📊 Traffic: {t}\n⏳ Duration: {d} days\n\n🔑 <b>Config (tap to copy):</b>\n<code>{c}</code>\n\n"
+            "📚 Guide: /start → Guide")
+    bot.send_message(to, txt.format(id=o["id"], p=esc(o["plan_name"]), t=traffic(to, o), d=o.get("days") or "∞", c=esc(cfg)))
+    q = qr_png(cfg)
+    if q: bot.send_photo(to, q, caption="QR")
+
+
+def deliver(o, cfg, staff):
+    now = now_utc()
+    exp = (now + timedelta(days=o["days"])).isoformat() if o.get("days") else None
+    upd("orders", {"id": o["id"]}, {"status": "delivered", "config": cfg, "delivered_at": now.isoformat(),
+                                    "expires_at": exp, "approved_by": o.get("approved_by") or staff})
+    send_config(o["user_id"], o, cfg)
+
+
+def notify_staff(o):
+    for sid in staff_ids():
+        send_order_card(sid, o)
+
+
+# ───────────────────────── Stats ─────────────────────────
+def stats_text(uid):
+    rows = _rest("GET", "orders", {"select": "id,price,status,approved_by,delivered_at"}, prefer=None)
+    today = now_utc().strftime("%Y-%m-%d")
+    def calc(uid_=None):
+        d = [o for o in rows if o["status"] == "delivered" and (uid_ is None or o.get("approved_by") == uid_)]
+        return len(d), sum(o["price"] or 0 for o in d), sum(o["price"] or 0 for o in d if fdate(o.get("delivered_at")) == today)
+    n, rev, td = calc(uid)
+    pend = len([o for o in rows if o["status"] in ("pending", "paid")])
+    t = x(uid, "📊 <b>آمار من</b>\n\n✅ سفارش‌های تحویل‌داده: {n}\n💰 فروش من: {r} تومان\n📅 فروش امروز: {t} تومان\n⏳ سفارش‌های در انتظار (کل): {p}",
+          "📊 <b>My stats</b>\n\n✅ Orders delivered: {n}\n💰 My sales: {r} T\n📅 Today: {t} T\n⏳ Pending (all): {p}").format(
+          n=n, r=money(rev), t=money(td), p=pend)
+    if is_owner(uid):
+        gn, grev, gtd = calc()
+        users = len(sel("users"))
+        t += x(uid, f"\n\n━━ 👑 آمار کل ━━\n👥 کاربران: {users}\n✅ تحویل‌شده: {gn}\n💰 فروش کل: {money(grev)} تومان\n📅 امروز: {money(gtd)} تومان\n❌ ردشده: {len([o for o in rows if o['status']=='rejected'])}",
+               f"\n\n━━ 👑 Global ━━\n👥 Users: {users}\n✅ Delivered: {gn}\n💰 Total sales: {money(grev)} T\n📅 Today: {money(gtd)} T\n❌ Rejected: {len([o for o in rows if o['status']=='rejected'])}")
+        t += "\n\n" + x(uid, "👮 <b>وضعیت ادمین‌ها و فروشنده‌ها</b>", "👮 <b>Staff status</b>")
+        for s in sel("users", raw={"role": "in.(admin,seller)"}):
+            c, r, tdy = calc(s["id"])
+            t += f"\n• {'🛡' if s['role']=='admin' else '🧑‍💼'} {esc(s['name'])} <code>{s['id']}</code> — {c} / {money(r)} ({x(uid,'امروز','today')} {money(tdy)})"
+    return t
+
+
+# ───────────────────────── Admin panel ─────────────────────────
+def admin_kb(uid):
+    if not is_admin(uid):
+        r = [[(x(uid, "📊 آمار من", "📊 My stats"), "a:stats"), (x(uid, "⏳ سفارش‌ها", "⏳ Orders"), "a:pend")]]
+    else:
+        shop = gs("shop_open", "1") == "1"
+        r = [[(x(uid, "📊 آمار", "📊 Stats"), "a:stats"), (x(uid, "⏳ سفارش‌ها", "⏳ Orders"), "a:pend")],
+             [(x(uid, "📦 مدیریت سرویس‌ها", "📦 Plans"), "a:plans"), (x(uid, "💳 شماره کارت", "💳 Card"), "a:card")],
+             [(x(uid, "📢 کانال اجباری", "📢 Forced channels"), "a:ch"), (x(uid, "👥 کاربران", "👥 Users"), "a:users")],
+             [(x(uid, "📣 پیام همگانی", "📣 Broadcast"), "a:bc"), (x(uid, "⚙️ تنظیمات", "⚙️ Settings"), "a:set")],
+             [(x(uid, "🟢 فروشگاه: باز", "🟢 Shop: open") if shop else x(uid, "🔴 فروشگاه: بسته", "🔴 Shop: closed"), "a:shop")]]
+        if is_owner(uid):
+            r.append([(x(uid, "👮 ادمین‌ها و فروشنده‌ها", "👮 Admins & sellers"), "a:staff")])
+    r.append([(x(uid, "🔼 بستن پنل مدیریت", "🔼 Collapse"), "a:close"), (x(uid, "🏠 منوی اصلی", "🏠 Main"), "p:main")])
+    return K(*r)
+
+
+def admin_route(call, uid, p):
+    a = p[1]
+    back = K(back_row(uid, "a:main"))
+    if a in ("open", "main"):
+        STATE.pop(uid, None)
+        return ui(uid, x(uid, f"🛠 <b>پنل مدیریت</b> ({role(uid)})", f"🛠 <b>Admin panel</b> ({role(uid)})"), admin_kb(uid), call)
+    if a == "close":
+        return ui(uid, x(uid, "🛠 پنل مدیریت بسته است.", "🛠 Admin panel collapsed."),
+                  K([(x(uid, "🔽 باز کردن پنل مدیریت", "🔽 Open admin panel"), "a:open")]), call)
+    if a == "stats": return ui(uid, stats_text(uid), back, call)
+    if a == "pend":
+        rows = sel("orders", raw={"status": "in.(pending,paid)"}, order="id.asc", limit=40)
+        if not rows: return ui(uid, x(uid, "✅ سفارش در انتظاری نیست.", "✅ No pending orders."), back, call)
+        b = [[(f"#{o['id']} {'💳' if o['status']=='paid' else '⏳'} {o['plan_name']} • {money(o['price'])}", f"o:v:{o['id']}")] for o in rows]
+        b.append(back_row(uid, "a:main"))
+        return ui(uid, x(uid, "⏳ <b>سفارش‌های در انتظار</b>\n⏳ = رسید بررسی نشده | 💳 = منتظر کانفیگ", "⏳ <b>Pending orders</b>\n⏳ = receipt to review | 💳 = waiting config"), K(*b), call)
+
+    # everything below is admin/owner only
+    if not is_admin(uid): return
+    if a == "shop":
+        ss("shop_open", "0" if gs("shop_open", "1") == "1" else "1")
+        return ui(uid, x(uid, f"🛠 <b>پنل مدیریت</b>", "🛠 <b>Admin panel</b>"), admin_kb(uid), call)
+    if a == "plans":
+        plans = sel("plans", order="price.asc")
+        b = []
+        txt = x(uid, "📦 <b>سرویس‌ها</b>\n\n", "📦 <b>Plans</b>\n\n")
+        for pl in plans:
+            txt += ("🟢 " if pl["active"] else "⚪️ ") + plan_line(uid, pl) + "\n\n"
+            b.append([(f"{'🔕' if pl['active'] else '🔔'} {pl['name']}", f"a:pt:{pl['id']}"), ("🗑", f"a:pd:{pl['id']}")])
+        b.append([(x(uid, "➕ افزودن سرویس", "➕ Add plan"), "a:pa")])
+        b.append(back_row(uid, "a:main"))
+        return ui(uid, txt, K(*b), call)
+    if a == "pa":
+        STATE[uid] = {"s": "addplan"}
+        return ui(uid, x(uid, "➕ در یک پیام بفرست:\n<code>نام | حجم‌GB | روز | قیمت‌تومان</code>\nمثال:\n<code>سرویس ۵۰ گیگ یک‌ماهه | 50 | 30 | 150000</code>\n(حجم 0 = نامحدود)",
+                         "➕ Send in one message:\n<code>name | GB | days | price</code>\nExample:\n<code>50GB Monthly | 50 | 30 | 150000</code>\n(GB 0 = unlimited)"),
+                  K(back_row(uid, "a:plans")), call)
+    if a == "pt":
+        pl = sel("plans", id=int(p[2]))
+        if pl: upd("plans", {"id": pl[0]["id"]}, {"active": not pl[0]["active"]})
+        return admin_route(call, uid, ["a", "plans"])
+    if a == "pd":
+        rm("plans", {"id": int(p[2])})
+        return admin_route(call, uid, ["a", "plans"])
+    if a == "card":
+        STATE[uid] = {"s": "card"}
+        return ui(uid, x(uid, f"💳 کارت فعلی: <code>{esc(gs('card_number','-'))}</code> — {esc(gs('card_holder','-'))}\n\nکارت جدید را بفرست:\n<code>شماره کارت | نام صاحب کارت</code>",
+                         f"💳 Current: <code>{esc(gs('card_number','-'))}</code> — {esc(gs('card_holder','-'))}\n\nSend new card:\n<code>card number | holder name</code>"), back, call)
+    if a == "ch":
+        chs = sel("channels")
+        b = [[(f"🗑 {c.get('title') or c['chat_id']}", f"a:chd:{c['id']}")] for c in chs]
+        b.append([(x(uid, "➕ افزودن کانال", "➕ Add channel"), "a:cha")])
+        b.append(back_row(uid, "a:main"))
+        return ui(uid, x(uid, "📢 <b>کانال‌های اجباری</b>\n(ربات باید در کانال ادمین باشد)", "📢 <b>Forced channels</b>\n(the bot must be admin there)"), K(*b), call)
+    if a == "cha":
+        STATE[uid] = {"s": "addch"}
+        return ui(uid, x(uid, "➕ یوزرنیم کانال را بفرست: <code>@mychannel</code>\nبرای کانال خصوصی: <code>-100123456789 https://t.me/+invite</code>",
+                         "➕ Send channel username: <code>@mychannel</code>\nPrivate: <code>-100123456789 https://t.me/+invite</code>"),
+                  K(back_row(uid, "a:ch")), call)
+    if a == "chd":
+        rm("channels", {"id": int(p[2])})
+        return admin_route(call, uid, ["a", "ch"])
+    if a == "users":
+        STATE[uid] = {"s": "lookup"}
+        return ui(uid, x(uid, f"👥 تعداد کاربران: <b>{len(sel('users'))}</b>\n\nبرای مدیریت کاربر، آیدی عددی‌اش را بفرست:",
+                         f"👥 Total users: <b>{len(sel('users'))}</b>\n\nSend a user's numeric ID to manage:"), back, call)
+    if a == "bc":
+        STATE[uid] = {"s": "bc"}
+        return ui(uid, x(uid, "📣 پیام همگانی را بفرست (متن/عکس/…):", "📣 Send the broadcast message (text/photo/…):"), back, call)
+    if a == "set":
+        return ui(uid, x(uid, "⚙️ <b>تنظیمات</b>", "⚙️ <b>Settings</b>"), K(
+            [(x(uid, "👋 متن خوش‌آمدگویی", "👋 Welcome text"), "a:sw:welcome")],
+            [(x(uid, "📚 متن آموزش", "📚 Guide text"), "a:sw:guide")],
+            [(x(uid, "🆘 متن اضافه پشتیبانی", "🆘 Extra support text"), "a:sw:support_extra")],
+            back_row(uid, "a:main")), call)
+    if a == "sw":
+        STATE[uid] = {"s": "set", "key": p[2]}
+        return ui(uid, x(uid, "✍️ متن جدید را بفرست (برای پاک کردن بنویس: -)", "✍️ Send the new text (send - to clear)"), K(back_row(uid, "a:set")), call)
+    if a == "staff" and is_owner(uid):
+        b, txt = [], x(uid, "👮 <b>ادمین‌ها و فروشنده‌ها</b>\n\n", "👮 <b>Admins & sellers</b>\n\n")
+        for s in sel("users", raw={"role": "in.(admin,seller)"}):
+            txt += f"{'🛡' if s['role']=='admin' else '🧑‍💼'} {esc(s['name'])} <code>{s['id']}</code>" + (f" 📞 {esc(s['phone'])}" if s.get("phone") else (" ⚠️ no phone" if s["role"] == "seller" else "")) + "\n"
+            b.append([(f"🗑 {s['name']}", f"a:srm:{s['id']}")])
+        b.append([(x(uid, "➕ ادمین", "➕ Admin"), "a:sadd:admin"), (x(uid, "➕ فروشنده", "➕ Seller"), "a:sadd:seller")])
+        b.append([(x(uid, "📊 وضعیت و آمار", "📊 Status & stats"), "a:stats")])
+        b.append(back_row(uid, "a:main"))
+        return ui(uid, txt, K(*b), call)
+    if a == "sadd" and is_owner(uid):
+        STATE[uid] = {"s": "addstaff", "role": p[2]}
+        return ui(uid, x(uid, "🆔 آیدی عددی شخص را بفرست (او باید قبلاً ربات را /start کرده باشد):", "🆔 Send the person's numeric ID (they must have /start-ed the bot):"),
+                  K(back_row(uid, "a:staff")), call)
+    if a == "srm" and is_owner(uid):
+        save_user(int(p[2]), role="user")
+        return admin_route(call, uid, ["a", "staff"])
+
+
+def show_user(uid, tid):
+    t = user(tid)
+    if not t:
+        return bot.send_message(uid, x(uid, "❌ کاربر پیدا نشد.", "❌ User not found."))
+    orders = sel("orders", user_id=tid, status="delivered")
+    txt = x(uid, "👤 <b>{n}</b> @{un}\n🆔 <code>{id}</code>\n🎖 {r}\n📞 {ph}\n📅 {j}\n✅ خریدها: {c} | 💰 {s} تومان\n🚫 مسدود: {b}",
+            "👤 <b>{n}</b> @{un}\n🆔 <code>{id}</code>\n🎖 {r}\n📞 {ph}\n📅 {j}\n✅ Purchases: {c} | 💰 {s} T\n🚫 Banned: {b}").format(
+            n=esc(t["name"]), un=esc(t.get("username")), id=tid, r=t["role"], ph=esc(t.get("phone") or "-"), j=fdate(t["joined_at"]),
+            c=len(orders), s=money(sum(o["price"] or 0 for o in orders)), b="✅" if t.get("banned") else "❌")
+    bot.send_message(uid, txt, reply_markup=K(
+        [(x(uid, "✅ رفع مسدودی" if t.get("banned") else "🚫 مسدود کردن", "✅ Unban" if t.get("banned") else "🚫 Ban"), f"u:ban:{tid}")],
+        [(x(uid, "📨 پیام به کاربر", "📨 Message user"), f"u:msg:{tid}"), (x(uid, "🎁 ارسال کانفیگ دستی", "🎁 Send config manually"), f"u:cfg:{tid}")]))
+
+
+def user_action(call, uid, p):
+    act, tid = p[1], int(p[2])
+    if act == "ban":
+        if tid == OWNER_ID: return
+        t = user(tid)
+        save_user(tid, banned=not t.get("banned"))
+        return show_user(uid, tid)
+    if act == "msg":
+        STATE[uid] = {"s": "umsg", "uid": tid}
+        bot.send_message(uid, x(uid, "✍️ پیام را بفرست:", "✍️ Send the message:"))
+    if act == "cfg":
+        STATE[uid] = {"s": "ucfg", "uid": tid}
+        bot.send_message(uid, x(uid, "🎁 فرمت:\nخط اول: <code>نام سرویس | روز | حجمGB</code>\nخط‌های بعد: کانفیگ",
+                                "🎁 Format:\nFirst line: <code>plan name | days | GB</code>\nNext lines: the config"))
+
+
+# ───────────────────────── Message states ─────────────────────────
+def do_broadcast(uid, m):
+    users = [u for u in sel("users") if not u.get("banned")]
+    ok = 0
+    for u in users:
+        try:
+            bot.copy_message(u["id"], m.chat.id, m.message_id)
+            ok += 1
+        except Exception:
+            pass
+        time.sleep(0.05)
+    bot.send_message(uid, x(uid, f"📣 ارسال شد: {ok}/{len(users)}", f"📣 Sent: {ok}/{len(users)}"))
+
+
+@bot.message_handler(content_types=["text", "photo", "document"])
+def h_msg(m):
+    uid = m.from_user.id
+    u = ensure_user(m.from_user)
+    st = STATE.get(uid)
+    txt = (m.text or "").strip()
+    if not st:
+        if not u.get("lang") or not passes(uid): return
+        return show_main(uid)
+    s = st["s"]
+    try:
+        if s == "receipt":
+            o = get_order(st["oid"])
+            if not o or o["status"] != "waiting_receipt":
+                STATE.pop(uid, None); return
+            if m.photo: upd("orders", {"id": o["id"]}, {"receipt_type": "photo", "receipt_file_id": m.photo[-1].file_id})
+            elif m.document: upd("orders", {"id": o["id"]}, {"receipt_type": "document", "receipt_file_id": m.document.file_id})
+            elif txt: upd("orders", {"id": o["id"]}, {"receipt_type": "text", "receipt_text": txt[:500]})
+            else: return
+            upd("orders", {"id": o["id"]}, {"status": "pending"})
+            STATE.pop(uid, None)
+            bot.send_message(uid, x(uid, f"✅ رسید سفارش #{o['id']} ارسال شد. پس از تأیید، کانفیگ برایت فرستاده می‌شود 🙏",
+                                    f"✅ Receipt for order #{o['id']} sent. Your config will arrive after approval 🙏"),
+                             reply_markup=K([(x(uid, "🏠 منوی اصلی", "🏠 Main"), "p:main")]))
+            return notify_staff(get_order(o["id"]))
+        if not is_staff(uid): return
+        if s == "deliver":
+            if not txt: return
+            o = get_order(st["oid"])
+            if o and o["status"] == "paid":
+                deliver(o, txt, uid)
+                bot.send_message(uid, x(uid, f"✅ کانفیگ سفارش #{o['id']} برای مشتری ارسال شد.", f"✅ Config for order #{o['id']} delivered."))
+            STATE.pop(uid, None)
+        elif s == "addplan":
+            n, g, d, pr = [i.strip() for i in txt.split("|")]
+            ins("plans", {"name": n, "traffic_gb": int(g), "days": int(d), "price": int(pr)})
+            STATE.pop(uid, None)
+            bot.send_message(uid, x(uid, "✅ سرویس افزوده شد.", "✅ Plan added."), reply_markup=K(back_row(uid, "a:plans")))
+        elif s == "card":
+            n, h = [i.strip() for i in txt.split("|", 1)]
+            ss("card_number", n); ss("card_holder", h)
+            STATE.pop(uid, None)
+            bot.send_message(uid, "✅", reply_markup=K(back_row(uid, "a:main")))
+        elif s == "addch":
+            parts = txt.split()
+            cid = parts[0]
+            chat = bot.get_chat(int(cid) if cid.lstrip("-").isdigit() else cid)
+            link = parts[1] if len(parts) > 1 else ("https://t.me/" + cid[1:] if cid.startswith("@") else "")
+            ins("channels", {"chat_id": cid, "title": chat.title, "link": link})
+            STATE.pop(uid, None)
+            bot.send_message(uid, x(uid, f"✅ کانال «{esc(chat.title)}» افزوده شد.", f"✅ Channel “{esc(chat.title)}” added."), reply_markup=K(back_row(uid, "a:ch")))
+        elif s == "lookup":
+            STATE.pop(uid, None)
+            show_user(uid, int(txt))
+        elif s == "umsg":
+            bot.copy_message(st["uid"], m.chat.id, m.message_id)
+            STATE.pop(uid, None)
+            bot.send_message(uid, "✅")
+        elif s == "ucfg":
+            first, _, cfg = txt.partition("\n")
+            parts = [i.strip() for i in first.split("|")]
+            days = int(parts[1]) if len(parts) > 1 else 30
+            o = ins("orders", {"user_id": st["uid"], "plan_name": parts[0], "days": days, "traffic_gb": int(parts[2]) if len(parts) > 2 else 0,
+                               "price": 0, "status": "paid", "approved_by": uid})
+            deliver(o, cfg.strip(), uid)
+            STATE.pop(uid, None)
+            bot.send_message(uid, "✅")
+        elif s == "bc":
+            STATE.pop(uid, None)
+            threading.Thread(target=do_broadcast, args=(uid, m), daemon=True).start()
+            bot.send_message(uid, x(uid, "📣 ارسال شروع شد…", "📣 Broadcasting…"))
+        elif s == "set":
+            ss(st["key"], "" if txt == "-" else txt)
+            STATE.pop(uid, None)
+            bot.send_message(uid, "✅", reply_markup=K(back_row(uid, "a:set")))
+        elif s == "addstaff":
+            tid = int(txt)
+            if not user(tid):
+                return bot.send_message(uid, x(uid, "❌ این کاربر هنوز ربات را استارت نکرده.", "❌ This user hasn't started the bot yet."))
+            save_user(tid, role=st["role"])
+            STATE.pop(uid, None)
+            bot.send_message(uid, "✅", reply_markup=K(back_row(uid, "a:staff")))
+            bot.send_message(tid, x(tid, f"🎉 شما به عنوان <b>{st['role']}</b> منصوب شدید. /start", f"🎉 You are now <b>{st['role']}</b>. /start"))
+            if st["role"] == "seller" and not user(tid).get("phone"): ask_phone(tid)
+    except Exception as e:
+        log.warning("state %s failed: %s", s, e)
+        bot.send_message(uid, x(uid, f"⚠️ ورودی نامعتبر یا خطا: {esc(e)}", f"⚠️ Invalid input or error: {esc(e)}"))
+
+
+# ───────────────────────── Flask / webhook ─────────────────────────
+@app.route("/")
+def index(): return "OK"
+
+
+@app.route("/health")
+def health(): return "alive"
+
+
+@app.route(f"/webhook/<token>", methods=["POST"])
+def webhook(token):
+    if token != BOT_TOKEN: abort(403)
+    try:
+        bot.process_new_updates([telebot.types.Update.de_json(request.get_data().decode("utf-8"))])
+    except Exception as e:
+        log.exception("update error: %s", e)
+    return "ok", 200
+
+
+def init_webhook():
+    if BASE_URL:
+        try:
+            bot.remove_webhook()
+            time.sleep(0.5)
+            bot.set_webhook(url=f"{BASE_URL}/webhook/{BOT_TOKEN}", max_connections=40)
+            log.info("Webhook set: %s", BASE_URL)
+        except Exception as e:
+            log.error("set_webhook failed: %s", e)
+
+
+init_webhook()
 
 if __name__ == "__main__":
-    init_db()
-    app.run(host="0.0.0.0", port=int(os.getenv("PORT","8080")))
+    if BASE_URL:
+        app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 10000)))
+    else:   # local test with polling
+        bot.remove_webhook()
+        bot.infinity_polling()
