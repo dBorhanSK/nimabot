@@ -4,8 +4,11 @@ services:
     runtime: python
     plan: free
     buildCommand: pip install -r requirements.txt
-    startCommand: python app.py
+    startCommand: gunicorn app:app --workers 1 --threads 8 --timeout 120
+    healthCheckPath: /health
     envVars:
+      - key: PYTHON_VERSION
+        value: "3.11.9"
       - key: BOT_TOKEN
         sync: false
       - key: OWNER_ID
@@ -16,3 +19,5 @@ services:
         sync: false
       - key: WEBHOOK_SECRET
         generateValue: true
+      - key: KEEPALIVE
+        value: "1"
