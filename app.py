@@ -307,8 +307,32 @@ def traffic(uid, p):
     return x(uid, "نامحدود", "Unlimited") if not g else f"{g} GB"
 
 
+def dur(uid, p):
+    d = p.get("days") or 0
+    return x(uid, "نامحدود", "Unlimited") if not d else f"{d} {x(uid, 'روز', 'days')}"
+
+
+_DIG = str.maketrans("۰۱۲۳۴۵۶۷۸۹٠١٢٣٤٥٦٧٨٩", "01234567890123456789")
+_UNL = ("", "-", "0", "∞", "نامحدود", "نا محدود", "unlimited", "inf", "unlim")
+
+
+def dig(s): return str(s).strip().translate(_DIG).replace(",", "").replace("،", "").replace("٬", "")
+
+
+def num(s):
+    """Number, or 0 for 'unlimited' words (نامحدود / unlimited / - / 0)."""
+    v = dig(s).lower()
+    return 0 if v in _UNL else int(v)
+
+
+def visible_plans(plans):
+    """Hide plans whose category is switched off."""
+    hidden = {c["id"] for c in sel("categories") if not c.get("active")}
+    return [p for p in plans if p.get("category_id") not in hidden]
+
+
 def plan_line(uid, p):
-    return (f"📦 <b>{esc(p['name'])}</b>\n   📊 {traffic(uid, p)}  •  ⏳ {p['days']} {x(uid, 'روز', 'days')}"
+    return (f"📦 <b>{esc(p['name'])}</b>\n   📊 {traffic(uid, p)}  •  ⏳ {dur(uid, p)}"
             f"  •  💵 {money(p['price'])} {x(uid, 'تومان', 'T')}")
 
 
@@ -477,16 +501,39 @@ def route(call, uid, d):
     if d == "tar":
         plans = sel("plans", active=True, order="price.asc")
         txt = x(uid, "💰 <b>تعرفه سرویس‌ها</b>\n\n", "💰 <b>Service tariffs</b>\n\n")
-        txt += "\n\n".join(plan_line(uid, pl) for pl in plans) if plans else x(uid, "هنوز سرویسی ثبت نشده.", "No plans yet.")
+        plans = visible_plans(plans)
+        cmap = {c["id"]: c["name"] for c in sel("categories", active=True, order="id.asc")}
+        if not plans:
+            txt += x(uid, "هنوز سرویسی ثبت نشده.", "No plans yet.")
+        elif not any(pl.get("category_id") in cmap for pl in plans):
+            txt += "\n\n".join(plan_line(uid, pl) for pl in plans)
+        else:
+            blocks = []
+            for cid, name in list(cmap.items()) + [(None, x(uid, "سایر", "Other"))]:
+                grp = [pl for pl in plans if (pl.get("category_id") if pl.get("category_id") in cmap else None) == cid]
+                if grp: blocks.append(f"📁 <b>{esc(name)}</b>\n\n" + "\n\n".join(plan_line(uid, pl) for pl in grp))
+            txt += "\n\n━━━━━━━━━━\n\n".join(blocks)
         return ui(uid, txt, K([(x(uid, "🛒 خرید", "🛒 Buy"), "buy")], back_row(uid)), call)
-    if d == "buy" or p[0] in ("b", "pay"):
+    if d == "buy" or p[0] in ("b", "pay", "bc"):
         if gs("shop_open", "1") == "0" and not is_staff(uid):
             return ui(uid, x(uid, "🔒 فروشگاه موقتاً بسته است.", "🔒 The shop is temporarily closed."), K(back_row(uid)), call)
-    if d == "buy":
-        plans = sel("plans", active=True, order="price.asc")
+    if d == "buy" or p[0] == "bc":
+        plans = visible_plans(sel("plans", active=True, order="price.asc"))
         if not plans:
             return ui(uid, x(uid, "هنوز سرویسی ثبت نشده.", "No plans yet."), K(back_row(uid)), call)
-        rows = [[(f"{pl['name']} • {money(pl['price'])}", f"b:{pl['id']}")] for pl in plans] + [back_row(uid)]
+        cats = [c for c in sel("categories", active=True, order="id.asc") if any(pl.get("category_id") == c["id"] for pl in plans)]
+        pbtn = lambda pl: [(f"{pl['name']} • {money(pl['price'])}", f"b:{pl['id']}")]
+        if p[0] == "bc":
+            cid = int(p[1])
+            cat = next((c for c in cats if c["id"] == cid), None)
+            if not cat: return ui(uid, x(uid, "این دسته در دسترس نیست.", "This category is unavailable."), K(back_row(uid, "buy")), call)
+            rows = [pbtn(pl) for pl in plans if pl.get("category_id") == cid] + [back_row(uid, "buy")]
+            return ui(uid, f"📁 <b>{esc(cat['name'])}</b>\n" + x(uid, "سرویس مورد نظرت را انتخاب کن:", "Choose your service:"), K(*rows), call)
+        if cats:
+            rows = [[(f"📁 {c['name']}", f"bc:{c['id']}")] for c in cats]
+            rows += [pbtn(pl) for pl in plans if not pl.get("category_id")] + [back_row(uid)]
+            return ui(uid, x(uid, "🛒 دسته‌بندی مورد نظرت را انتخاب کن:", "🛒 Choose a category:"), K(*rows), call)
+        rows = [pbtn(pl) for pl in plans] + [back_row(uid)]
         return ui(uid, x(uid, "🛒 سرویس مورد نظرت را انتخاب کن:", "🛒 Choose your service:"), K(*rows), call)
     if p[0] == "b":
         pl = sel("plans", id=int(p[1]), active=True)
@@ -500,7 +547,7 @@ def route(call, uid, d):
             txt += x(uid, "پس از پرداخت روی «ارسال رسید» بزن و عکس رسید را بفرست.", "After paying tap “Send receipt” and upload the receipt photo.")
         else:
             txt += x(uid, "⚠️ شماره کارت هنوز تنظیم نشده؛ با پشتیبانی تماس بگیر.", "⚠️ Card not set yet; contact support.")
-        rows = ([[(x(uid, "📤 ارسال رسید", "📤 Send receipt"), f"pay:{pl['id']}")]] if card else []) + [back_row(uid, "buy")]
+        rows = ([[(x(uid, "📤 ارسال رسید", "📤 Send receipt"), f"pay:{pl['id']}")]] if card else []) + [back_row(uid, f"bc:{pl['category_id']}" if pl.get("category_id") else "buy")]
         return ui(uid, txt, K(*rows), call)
     if p[0] == "pay":
         pl = sel("plans", id=int(p[1]), active=True)
@@ -649,9 +696,9 @@ def order_action(call, uid, p):
 
 def send_config(to, o, cfg):
     long_cfg = len(cfg) > 2500
-    txt = x(to, "✅ <b>سفارش #{id} تحویل شد</b>\n📦 {p}\n📊 حجم: {t}\n⏳ مدت: {d} روز\n\n🔑 <b>کانفیگ (لمس برای کپی):</b>\n<code>{c}</code>\n\n📚 آموزش اتصال: /start ← آموزش اتصال",
-            "✅ <b>Order #{id} delivered</b>\n📦 {p}\n📊 Traffic: {t}\n⏳ Duration: {d} days\n\n🔑 <b>Config (tap to copy):</b>\n<code>{c}</code>\n\n📚 Guide: /start → Guide")
-    send(to, txt.format(id=o["id"], p=esc(o["plan_name"]), t=traffic(to, o), d=o.get("days") or "∞",
+    txt = x(to, "✅ <b>سفارش #{id} تحویل شد</b>\n📦 {p}\n📊 حجم: {t}\n⏳ مدت: {d}\n\n🔑 <b>کانفیگ (لمس برای کپی):</b>\n<code>{c}</code>\n\n📚 آموزش اتصال: /start ← آموزش اتصال",
+            "✅ <b>Order #{id} delivered</b>\n📦 {p}\n📊 Traffic: {t}\n⏳ Duration: {d}\n\n🔑 <b>Config (tap to copy):</b>\n<code>{c}</code>\n\n📚 Guide: /start → Guide")
+    send(to, txt.format(id=o["id"], p=esc(o["plan_name"]), t=traffic(to, o), d=dur(to, o),
                         c=x(to, "(طولانی است؛ در فایل زیر)", "(too long; see file below)") if long_cfg else esc(cfg)))
     if long_cfg:
         f = io.BytesIO(cfg.encode()); f.name = f"config-{o['id']}.txt"
@@ -740,19 +787,58 @@ def admin_route(call, uid, p):
         return ui(uid, x(uid, "🛠 <b>پنل مدیریت</b>", "🛠 <b>Admin panel</b>"), admin_kb(uid), call)
     if a == "plans":
         b, txt = [], x(uid, "📦 <b>سرویس‌ها</b>\n\n", "📦 <b>Plans</b>\n\n")
+        cmap = {c["id"]: c["name"] for c in sel("categories")}
         for pl in sel("plans", order="price.asc"):
-            txt += ("🟢 " if pl["active"] else "⚪️ ") + plan_line(uid, pl) + "\n\n"
+            txt += ("🟢 " if pl["active"] else "⚪️ ") + plan_line(uid, pl) + (f"\n   📁 {esc(cmap[pl['category_id']])}" if pl.get("category_id") in cmap else "") + "\n\n"
             b.append([(f"{'🔕' if pl['active'] else '🔔'} {pl['name'][:18]}", f"a:pt:{pl['id']}"), ("✏️", f"a:pe:{pl['id']}"), ("🗑", f"a:pd:{pl['id']}")])
-        b += [[(x(uid, "➕ افزودن سرویس", "➕ Add plan"), "a:pa")], back_row(uid, "a:main")]
+        b += [[(x(uid, "➕ افزودن سرویس", "➕ Add plan"), "a:pa"), (x(uid, "📁 دسته‌بندی‌ها", "📁 Categories"), "a:cats")], back_row(uid, "a:main")]
         return ui(uid, txt, K(*b), call)
-    fmt_fa = "<code>نام | حجم‌GB | روز | قیمت‌تومان</code>\nمثال:\n<code>سرویس ۵۰ گیگ یک‌ماهه | 50 | 30 | 150000</code>\n(حجم 0 = نامحدود)"
-    fmt_en = "<code>name | GB | days | price</code>\nExample:\n<code>50GB Monthly | 50 | 30 | 150000</code>\n(GB 0 = unlimited)"
-    if a == "pa":
-        st_set(uid, {"s": "addplan"})
+    fmt_fa = "<code>نام | حجم‌GB | روز | قیمت‌تومان</code>\nمثال:\n<code>سرویس ۵۰ گیگ یک‌ماهه | 50 | 30 | 150000</code>\n(حجم یا روز: عدد 0 یا کلمهٔ «نامحدود» = نامحدود)"
+    fmt_en = "<code>name | GB | days | price</code>\nExample:\n<code>50GB Monthly | 50 | 30 | 150000</code>\n(GB or days: 0 or the word “unlimited” = unlimited)"
+    if a in ("pa", "pac"):
+        allc = sel("categories", order="id.asc")
+        if a == "pa" and allc:
+            rows = [[(f"📁 {c['name']}", f"a:pac:{c['id']}")] for c in allc] + [[(x(uid, "📂 بدون دسته", "📂 No category"), "a:pac:0")], back_row(uid, "a:plans")]
+            return ui(uid, x(uid, "📁 سرویس در کدام دسته قرار بگیرد؟", "📁 Which category should the plan go in?"), K(*rows), call)
+        st_set(uid, {"s": "addplan", "cat": (int(p[2]) or None) if a == "pac" else None})
         return ui(uid, x(uid, "➕ در یک پیام بفرست:\n" + fmt_fa, "➕ Send in one message:\n" + fmt_en), K(back_row(uid, "a:plans")), call)
     if a == "pe":
         st_set(uid, {"s": "editplan", "pid": int(p[2])})
-        return ui(uid, x(uid, "✏️ مشخصات جدید را بفرست:\n" + fmt_fa, "✏️ Send the new details:\n" + fmt_en), K(back_row(uid, "a:plans")), call)
+        allc = sel("categories", order="id.asc")
+        mv = ([[(x(uid, "📁 انتقال به: ", "📁 Move to: ") + c["name"], f"a:pm:{p[2]}:{c['id']}")] for c in allc]
+              + [[(x(uid, "📂 انتقال به: بدون دسته", "📂 Move to: no category"), f"a:pm:{p[2]}:0")]]) if allc else []
+        return ui(uid, x(uid, "✏️ مشخصات جدید را بفرست:\n" + fmt_fa, "✏️ Send the new details:\n" + fmt_en), K(*(mv + [back_row(uid, "a:plans")])), call)
+    if a == "pm":
+        upd("plans", {"id": int(p[2])}, {"category_id": int(p[3]) or None})
+        st_clear(uid)
+        return admin_route(call, uid, ["a", "plans"])
+    # ── categories ──
+    if a == "cats":
+        plans_all = sel("plans")
+        b, txt = [], x(uid, "📁 <b>دسته‌بندی‌ها</b>\nمثلاً: سرور معمولی، گیمینگ\n\n", "📁 <b>Categories</b>\nE.g. Standard, Gaming\n\n")
+        for c in sel("categories", order="id.asc"):
+            n = len([pl for pl in plans_all if pl.get("category_id") == c["id"]])
+            txt += f"{'🟢' if c['active'] else '⚪️'} {esc(c['name'])} ({n})\n"
+            b.append([(f"{'🔕' if c['active'] else '🔔'} {c['name'][:14]}", f"a:ct:{c['id']}"), ("✏️", f"a:ce:{c['id']}"), ("🗑", f"a:cd:{c['id']}")])
+        b += [[(x(uid, "➕ افزودن دسته", "➕ Add category"), "a:cadd")], back_row(uid, "a:plans")]
+        return ui(uid, txt, K(*b), call)
+    if a == "cadd":
+        st_set(uid, {"s": "cadd"})
+        return ui(uid, x(uid, "📁 نام دسته را بفرست (مثلاً: گیمینگ):", "📁 Send the category name (e.g. Gaming):"), K(back_row(uid, "a:cats")), call)
+    if a == "ce":
+        st_set(uid, {"s": "cedit", "cid": int(p[2])})
+        return ui(uid, x(uid, "✏️ نام جدید دسته را بفرست:", "✏️ Send the new category name:"), K(back_row(uid, "a:cats")), call)
+    if a == "ct":
+        c = sel("categories", id=int(p[2]))
+        if c: upd("categories", {"id": c[0]["id"]}, {"active": not c[0]["active"]})
+        return admin_route(call, uid, ["a", "cats"])
+    if a == "cd":
+        return ui(uid, x(uid, "🗑 این دسته حذف شود؟ سرویس‌های داخلش حذف نمی‌شوند و «بدون دسته» می‌شوند.", "🗑 Delete this category? Its plans are kept and become uncategorized."),
+                  K([(x(uid, "✅ بله، حذف", "✅ Yes, delete"), f"a:cdy:{p[2]}"), (x(uid, "❌ خیر", "❌ No"), "a:cats")]), call)
+    if a == "cdy":
+        upd("plans", {"category_id": int(p[2])}, {"category_id": None})
+        rm("categories", {"id": int(p[2])})
+        return admin_route(call, uid, ["a", "cats"])
     if a == "pt":
         pl = sel("plans", id=int(p[2]))
         if pl: upd("plans", {"id": pl[0]["id"]}, {"active": not pl[0]["active"]})
@@ -833,7 +919,7 @@ def user_action(call, uid, p):
         send(uid, x(uid, "✍️ پیام را بفرست:", "✍️ Send the message:"))
     if act == "cfg":
         st_set(uid, {"s": "ucfg", "uid": tid})
-        send(uid, x(uid, "🎁 فرمت:\nخط اول: <code>نام سرویس | روز | حجمGB</code>\nخط‌های بعد: کانفیگ", "🎁 Format:\nFirst line: <code>plan name | days | GB</code>\nNext lines: the config"))
+        send(uid, x(uid, "🎁 فرمت:\nخط اول: <code>نام سرویس | روز | حجمGB</code> (0 یا نامحدود = نامحدود)\nخط‌های بعد: کانفیگ", "🎁 Format:\nFirst line: <code>plan name | days | GB</code>\nNext lines: the config"))
 
 
 # ═════════════════════════ Message states ═════════════════════════
@@ -911,10 +997,20 @@ def h_msg(m):
         if not is_admin(uid): return
         if s in ("addplan", "editplan"):
             n, g, d, pr = [i.strip() for i in txt.split("|")]
-            row = {"name": n, "traffic_gb": int(g), "days": int(d), "price": int(pr)}
-            ins("plans", row) if s == "addplan" else upd("plans", {"id": st["pid"]}, row)
+            row = {"name": n, "traffic_gb": num(g), "days": num(d), "price": int(dig(pr))}
+            if s == "addplan":
+                if st.get("cat"): row["category_id"] = st["cat"]
+                ins("plans", row)
+            else:
+                upd("plans", {"id": st["pid"]}, row)
             st_clear(uid)
             send(uid, x(uid, "✅ ذخیره شد.", "✅ Saved."), K(back_row(uid, "a:plans")))
+        elif s in ("cadd", "cedit"):
+            if not txt: return
+            if s == "cadd": ins("categories", {"name": txt[:40]})
+            else: upd("categories", {"id": st["cid"]}, {"name": txt[:40]})
+            st_clear(uid)
+            send(uid, "✅", K(back_row(uid, "a:cats")))
         elif s == "card":
             n, h = [i.strip() for i in txt.split("|", 1)]
             ss("card_number", n); ss("card_holder", h)
@@ -943,8 +1039,8 @@ def h_msg(m):
             first, _, cfg = txt.partition("\n")
             parts = [i.strip() for i in first.split("|")]
             if not cfg.strip(): raise ValueError("config is empty")
-            o = ins("orders", {"user_id": st["uid"], "plan_name": parts[0], "days": int(parts[1]) if len(parts) > 1 else 30,
-                               "traffic_gb": int(parts[2]) if len(parts) > 2 else 0, "price": 0, "status": "paid", "approved_by": uid})
+            o = ins("orders", {"user_id": st["uid"], "plan_name": parts[0], "days": num(parts[1]) if len(parts) > 1 else 30,
+                               "traffic_gb": num(parts[2]) if len(parts) > 2 else 0, "price": 0, "status": "paid", "approved_by": uid})
             deliver(o, cfg.strip(), uid)
             st_clear(uid)
             send(uid, "✅")
