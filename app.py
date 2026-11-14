@@ -131,6 +131,30 @@ def get_channels():
     return CH_CACHE[0]
 
 
+# ── channel locking (owner-only) ──
+def locked_channels():
+    """Return the set of channel row IDs that are locked (owner-only removable)."""
+    try:
+        v = gs("locked_channels", "")
+        return set(int(i) for i in json.loads(v)) if v else set()
+    except Exception:
+        return set()
+
+
+def is_channel_locked(cid):
+    try:
+        return int(cid) in locked_channels()
+    except Exception:
+        return False
+
+
+def set_channel_locked(cid, locked):
+    s = locked_channels()
+    if locked: s.add(int(cid))
+    else: s.discard(int(cid))
+    ss("locked_channels", json.dumps(sorted(s)))
+
+
 # ── persistent conversation state (survives Render sleep/restart) ──
 def st_get(uid):
     v = STATE.get(uid, _NS)
@@ -855,14 +879,38 @@ def admin_route(call, uid, p):
                          f"💳 Current: <code>{esc(gs('card_number', '-'))}</code> — {esc(gs('card_holder', '-'))}\n\nSend new card:\n<code>card number | holder name</code>"), back, call)
     if a == "ch":
         chs = get_channels()
-        b = [[(f"🗑 {c.get('title') or c['chat_id']}", f"a:chd:{c['id']}")] for c in chs] + [[(x(uid, "➕ افزودن کانال", "➕ Add channel"), "a:cha")], back_row(uid, "a:main")]
-        return ui(uid, x(uid, "📢 <b>کانال‌های اجباری</b>\n(ربات باید در کانال ادمین باشد)", "📢 <b>Forced channels</b>\n(the bot must be admin there)"), K(*b), call)
+        locked = locked_channels()
+        b = []
+        for c in chs:
+            label = c.get('title') or c['chat_id']
+            cid = c['id']
+            is_locked = cid in locked
+            if is_owner(uid):
+                lock_icon = "🔓" if is_locked else "🔒"
+                b.append([(f"{lock_icon} {label}", f"a:chl:{cid}"), ("🗑", f"a:chd:{cid}")])
+            else:
+                icon = "🔒" if is_locked else "🗑"
+                b.append([(f"{icon} {label}", f"a:chd:{cid}")])
+        b += [[(x(uid, "➕ افزودن کانال", "➕ Add channel"), "a:cha")], back_row(uid, "a:main")]
+        hint = x(uid, "\n\n🔒 = قفل | 🔓 = آزاد | 🗑 = حذف", "\n\n🔒 = lock | 🔓 = unlock | 🗑 = delete") if is_owner(uid) else \
+               x(uid, "\n\n🔒 = قفل‌شده توسط مالک", "\n\n🔒 = locked by owner")
+        return ui(uid, x(uid, "📢 <b>کانال‌های اجباری</b>\n(ربات باید در کانال ادمین باشد)" + hint,
+                         "📢 <b>Forced channels</b>\n(the bot must be admin there)" + hint), K(*b), call)
+    if a == "chl" and is_owner(uid):
+        cid = int(p[2])
+        set_channel_locked(cid, not is_channel_locked(cid))
+        return admin_route(call, uid, ["a", "ch"])
     if a == "cha":
         st_set(uid, {"s": "addch"})
         return ui(uid, x(uid, "➕ یوزرنیم کانال را بفرست: <code>@mychannel</code>\nکانال خصوصی: <code>-100123456789 https://t.me/+invite</code>",
                          "➕ Send channel username: <code>@mychannel</code>\nPrivate: <code>-100123456789 https://t.me/+invite</code>"), K(back_row(uid, "a:ch")), call)
     if a == "chd":
-        rm("channels", {"id": int(p[2])})
+        cid = int(p[2])
+        if is_channel_locked(cid) and not is_owner(uid):
+            return ui(uid, x(uid, "🔒 این کانال توسط مالک قفل شده و فقط مالک می‌تواند آن را حذف کند.",
+                             "🔒 This channel is locked by the owner and only the owner can remove it."),
+                      K(back_row(uid, "a:ch")), call)
+        rm("channels", {"id": cid})
         CH_CACHE[0] = None
         JOINED.clear()
         return admin_route(call, uid, ["a", "ch"])
